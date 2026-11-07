@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Skerry
+Comment=Fri, öppen, fristående SSH-klient
+Exec=skerry-linuxapp
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;RemoteAccess;

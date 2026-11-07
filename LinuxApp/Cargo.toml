@@ -1,0 +1,64 @@
+[package]
+name = "skerry-linuxapp"
+version = "0.1.0"
+edition = "2024"
+#  Lägsta Rust-version som faktiskt bygger projektet. VERIFIERAD, inte
+# antagen: `cargo +1.92 build` + hela testsviten (203/203) kördes på
+# just den toolchainen. Sätts inte av vår egen kod — `edition = "2024"`
+# kräver bara 1.85 — utan av GTK-stacken, som höjde sitt krav till 1.92
+# (`gdk4`/`cairo-rs`/`gio`). Utan det här fältet får den som har en för
+# gammal toolchain ett kryptiskt syntaxfel i stället för ett tydligt
+# "requires rustc 1.92".
+#
+# CI väljer `stable` via rustup på GitHub-hosted runner; det här är golvet,
+# inte vad vi bygger med till vardags. Höj det när ett beroende kräver mer
+# (bygget säger då själv vilken version), och kör om testsviten på den nya
+# siffran så den förblir verifierad.
+rust-version = "1.92"
+
+# Integrationerna (Docker/Kubernetes/Proxmox) ligger i ett EGET paket,
+# vilket specifikationen efterfrågar som "alla plugins separata paket". Gränsen är
+# inte kosmetisk: paketet har noll beroenden, så ingenting där kan nå
+# GTK, russh eller filsystemet ens av misstag.
+[workspace]
+members = ["integrations"]
+
+[dependencies]
+skerry-integrations = { path = "integrations" }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
+# RSA support is DISABLED, not just unused: the `rsa` crate is pulled in by
+# russh's default feature `rsa` and has RUSTSEC-2023-0071 (the Marvin attack)
+# with no fixed version. `default-features = false` removes it from the
+# dependency tree entirely. `flate2` and `aws-lc-rs` are the other two
+# default features and must therefore be re-enabled explicitly.
+# Turn `rsa` back on once the advisory has a fix; see docs/rsa-disabled.md.
+russh = { version = "0.65.1", default-features = false, features = ["flate2", "aws-lc-rs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.1", features = ["v4", "serde"] }
+dirs = "7"
+async-channel = "2.5.0"
+async-trait = "0.1.92"
+vte = { version = "0.10", package = "vte4" }
+russh-sftp = "3.0.1"
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+sha2 = "0.11.1"
+aes-gcm = "0.11.1"
+rand = "0.10.3"
+base64 = "0.23.1"
+hmac = "0.13"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "form"] }
+# Uppackning av hämtade verktygsarkiv (se `external_binary_fetcher`).
+# Tailscale levererar en `.tgz`, inte en naken binär. Rena Rust-crates
+# utan C-beroenden, och `flate2` fanns redan i trädet via reqwest.
+tar = "0.4.46"
+flate2 = "1.1.11"
+quick-xml = "0.42"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+libc = "0.2.191"
+# Syntax highlighting i SFTP-editorn. Inga versionsfeatures (`v5_10`,
+# `v5_12` …) — de kräver ett nyare GtkSourceView än den äldsta distro vi
+# paketerar för kan ha, och inget vi använder behöver dem. Basnivån räcker.
+sourceview5 = { version = "0.11.2", default-features = false }
