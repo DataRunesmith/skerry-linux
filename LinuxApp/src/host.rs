@@ -328,6 +328,13 @@ impl HostStore {
     /// `upsert`/`delete` skrev då permanent över en bara TRUNKERAD (inte
     /// tom) fil med ett tomt tillstånd, en tyst dataförlust utan varning.
     fn load(path: &std::path::Path) -> std::io::Result<SyncState> {
+        // Prevent path traversal attacks by rejecting paths containing '..'.
+        if path.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid input: {}", path.display()),
+            ));
+        }
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncState::default()),
