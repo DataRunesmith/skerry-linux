@@ -108,6 +108,7 @@ pub struct SshSession {
 pub(crate) enum ConnectError {
     Russh(russh::Error),
     HostKeyChanged(String),
+    KnownHostsStorage,
 }
 
 impl From<russh::Error> for ConnectError {
@@ -121,6 +122,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Russh(e) => write!(f, "{e}"),
             ConnectError::HostKeyChanged(msg) => write!(f, "{msg}"),
+            ConnectError::KnownHostsStorage => write!(f, "known_hosts kunde inte sparas säkert; SSH-anslutningen avvisades"),
         }
     }
 }
@@ -206,6 +208,7 @@ impl client::Handler for ClientHandler {
                  ~/.skerry/known_hosts manuellt.",
                 self.host, self.port
             ))),
+            Verdict::StorageFailure => Err(ConnectError::KnownHostsStorage),
         }
     }
 
