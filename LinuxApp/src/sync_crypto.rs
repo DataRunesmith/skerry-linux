@@ -240,6 +240,18 @@ mod tests {
     }
 
     #[test]
+    fn seal_rejects_out_of_range_iteration_counts() {
+        assert_eq!(
+            seal(&SyncState::default(), "pw", MIN_ITERATIONS - 1).unwrap_err(),
+            SyncCryptoError::BadFormat
+        );
+        assert_eq!(
+            seal(&SyncState::default(), "pw", MAX_ITERATIONS + 1).unwrap_err(),
+            SyncCryptoError::BadFormat
+        );
+    }
+
+    #[test]
     fn wrong_passphrase_fails() {
         let state = SyncState::default();
         let sealed = seal(&state, "rätt", 1000).unwrap();
