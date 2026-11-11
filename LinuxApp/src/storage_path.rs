@@ -18,6 +18,22 @@ fn missing_home_error() -> io::Error {
 
 fn resolve_from_home(home: Option<PathBuf>, relative: &Path) -> io::Result<PathBuf> {
     let home = home.ok_or_else(missing_home_error)?;
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lagringssökvägen måste vara relativ och får inte innehålla '..'",
+        ));
+    }
     Ok(home.join(SKERRY_DIR).join(relative))
 }
 
@@ -43,6 +59,19 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("hemkatalog"));
         assert!(err.to_string().contains("~/.skerry"));
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_directory_paths() {
+        let home = PathBuf::from("/home/example");
+        assert_eq!(
+            resolve_from_home(Some(home.clone()), Path::new("../outside")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            resolve_from_home(Some(home), Path::new("/etc/passwd")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
