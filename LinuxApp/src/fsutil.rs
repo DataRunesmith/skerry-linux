@@ -32,7 +32,12 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 
     let write_result = (|| -> io::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp_path)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
         file.write_all(data)?;
         file.sync_all()
     })();
@@ -40,7 +45,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
-    std::fs::rename(&tmp_path, path)
+    std::fs::rename(&tmp_path, path)?;
+    // Persist the directory entry as well as the file contents.
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -74,6 +81,20 @@ mod tests {
         // men detta bevisar åtminstone att andra omgången skriver rent och
         // inte lämnar kvar den gamla, längre datan sammanslagen med den nya.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nytt");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn writes_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "skerry-atomic-write-mode-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.json");
+        atomic_write(&path, b"secret").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).ok();
     }
 
