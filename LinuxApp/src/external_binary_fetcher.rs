@@ -94,6 +94,13 @@ pub async fn fetch(
     if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ExternalBinaryError::InvalidChecksum);
     }
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    let cache_metadata = std::fs::symlink_metadata(cache_dir)
+        .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+        return Err(ExternalBinaryError::CacheWriteFailed("cache path is not a real directory".into()));
+    }
     let destination = cache_dir.join(binary_name);
     if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
