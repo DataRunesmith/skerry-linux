@@ -16,6 +16,8 @@ pub enum Verdict {
     Learned,
     /// Skiljer sig från lagrad nyckel (potentiell MITM eller ombyggd server).
     Changed(String),
+    /// The trust store could not be read or durably updated.
+    StorageFailure,
 }
 
 pub struct KnownHosts {
@@ -113,11 +115,30 @@ impl KnownHosts {
     /// "går inte att tolka"). Värt att rapportera uppåt till Swift-sidan.
     fn load(path: Option<&Path>) -> std::io::Result<HashMap<String, String>> {
         let Some(path) = path else { return Ok(HashMap::new()) };
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = match options.open(path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(e),
         };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts must be a regular file no larger than 4 MiB",
+            ));
+        }
+        let mut text = String::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+        if text.len() > 4 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts exceeded the 4 MiB read limit",
+            ));
+        }
         Ok(text
             .lines()
             .filter_map(|line| line.split_once(' '))
@@ -137,9 +158,13 @@ impl KnownHosts {
                 Verdict::Changed(stored.clone())
             }
         } else {
-            entries.insert(id.clone(), key_string.to_string());
-            self.append(&id, key_string);
-            Verdict::Learned
+            match self.append(&id, key_string) {
+                Ok(()) => {
+                    entries.insert(id, key_string.to_string());
+                    Verdict::Learned
+                }
+                Err(_) => Verdict::StorageFailure,
+            }
         }
     }
 
@@ -195,28 +220,27 @@ impl KnownHosts {
         Ok(true)
     }
 
-    fn append(&self, id: &str, key_string: &str) {
-        let Some(path) = &self.path else { return };
+    fn append(&self, id: &str, key_string: &str) -> std::io::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
-        let existed = path.exists();
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(format!("{id} {key_string}\n").as_bytes());
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "known_hosts is not a regular file"));
         }
-        if !existed {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(format!("{id} {key_string}\\n").as_bytes())?;
+        file.sync_all()
     }
 }
 
