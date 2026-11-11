@@ -34,7 +34,36 @@ fn resolve_from_home(home: Option<PathBuf>, relative: &Path) -> io::Result<PathB
             "lagringssökvägen måste vara relativ och får inte innehålla '..'",
         ));
     }
-    Ok(home.join(SKERRY_DIR).join(relative))
+    let root = home.join(SKERRY_DIR);
+    let components: Vec<_> = relative.components().collect();
+    let mut candidate = root.clone();
+    let mut path_components = vec![root.clone()];
+    for component in &components {
+        if let std::path::Component::Normal(part) = component {
+            candidate.push(part);
+            path_components.push(candidate.clone());
+        }
+    }
+    for (index, candidate) in path_components.iter().enumerate() {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lagringskataloger får inte vara symboliska länkar",
+                ));
+            }
+            Ok(metadata) if index + 1 < path_components.len() && !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "en överordnad lagringskomponent är inte en katalog",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root.join(relative))
 }
 
 /// Resolve a path below `~/.skerry` without creating anything.
