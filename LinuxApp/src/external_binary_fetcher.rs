@@ -36,6 +36,9 @@ pub enum ExternalBinaryError {
     /// namn som ändrats mellan versioner, inte ett nätverksproblem.
     EntryNotFound(String),
     ExtractFailed(String),
+    InvalidBinaryName,
+    InvalidChecksum,
+    DownloadTooLarge,
 }
 
 impl std::fmt::Display for ExternalBinaryError {
@@ -50,10 +53,22 @@ impl std::fmt::Display for ExternalBinaryError {
                 write!(f, "fel checksumma: förväntade {expected}, fick {actual}")
             }
             ExternalBinaryError::CacheWriteFailed(e) => write!(f, "kunde inte skriva till cachen: {e}"),
+            ExternalBinaryError::InvalidBinaryName => write!(f, "ogiltigt binärfilnamn"),
+            ExternalBinaryError::InvalidChecksum => write!(f, "ogiltigt SHA256-värde"),
+            ExternalBinaryError::DownloadTooLarge => write!(f, "nedladdningen överskred storleksgränsen"),
         }
     }
 }
 
+const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn validate_binary_name(name: &str) -> Result<(), ExternalBinaryError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\\\') || name.contains('\\0') {
+        return Err(ExternalBinaryError::InvalidBinaryName);
+    }
+    Ok(())
+}
 pub fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -74,13 +89,22 @@ pub async fn fetch(
     cache_dir: &std::path::Path,
     binary_name: &str,
 ) -> Result<std::path::PathBuf, ExternalBinaryError> {
+    validate_binary_name(binary_name)?;
+    let expected = expected_sha256.to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ExternalBinaryError::InvalidChecksum);
+    }
     let destination = cache_dir.join(binary_name);
-    let expected = expected_sha256.to_lowercase();
-
-    if let Ok(existing) = std::fs::read(&destination)
-        && sha256_hex(&existing) == expected
-    {
-        return Ok(destination);
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            std::fs::remove_file(&destination).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+        } else if metadata.len() <= MAX_BINARY_BYTES {
+            if let Ok(existing) = std::fs::read(&destination)
+                && sha256_hex(&existing) == expected
+            {
+                return Ok(destination);
+            }
+        }
     }
     // Finns men med fel checksumma (korrupt eller ett gammalt, felaktigt
     // cachat försök) — städa bort tyst, hämta rent på nytt nedan.
