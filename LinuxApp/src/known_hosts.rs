@@ -195,9 +195,9 @@ impl KnownHosts {
     /// nästa gång, alltså precis det MITM-skydd filen finns för.
     pub fn forget(&self, id: &str) -> std::io::Result<bool> {
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
-        if entries.remove(id).is_none() {
+        let Some(removed) = entries.remove(id) else {
             return Ok(false);
-        }
+        };
         let Some(path) = &self.path else {
             return Ok(true);
         };
@@ -211,11 +211,9 @@ impl KnownHosts {
         if !text.is_empty() {
             text.push('\n');
         }
-        crate::fsutil::atomic_write(path, text.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(error) = crate::fsutil::atomic_write(path, text.as_bytes()) {
+            entries.insert(id.to_string(), removed);
+            return Err(error);
         }
         Ok(true)
     }
@@ -283,6 +281,29 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_trust_store_is_rejected_and_never_learns_a_key() {
+        use std::os::unix::fs::symlink;
+        let root = temp_path();
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.join("outside");
+        let link = root.join("known_hosts");
+        std::fs::write(&outside, "srv:22 ssh-ed25519 AAAAattacker\\n").unwrap();
+        symlink(&outside, &link).unwrap();
+
+        assert!(KnownHosts::open(Some(link.clone())).is_err());
+        let store = KnownHosts {
+            path: Some(link),
+            entries: Mutex::new(HashMap::new()),
+        };
+        assert_eq!(store.check("srv", 22, "ssh-ed25519 AAAAattacker"), Verdict::StorageFailure);
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "srv:22 ssh-ed25519 AAAAattacker\\n"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
     #[test]
     fn different_ports_are_independent_hosts() {
         let path = temp_path();
