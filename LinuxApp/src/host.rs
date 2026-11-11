@@ -509,10 +509,10 @@ impl HostStore {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
-        // Re-check after directory creation so an existing symlinked parent
+        let json = serde_json::to_string_pretty(&self.state)?;
+        // Re-check immediately before writing so a replaced parent directory
         // is rejected before the atomic write is attempted.
         crate::storage_path::validate_storage_path(&self.path)?;
-        let json = serde_json::to_string_pretty(&self.state)?;
         crate::fsutil::atomic_write(&self.path, json.as_bytes())
     }
 
