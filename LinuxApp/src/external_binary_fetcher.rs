@@ -218,13 +218,20 @@ pub fn extract_file_from_tar_gz(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name != wanted_file_name {
+        if name != wanted_file_name || !entry.header().entry_type().is_file() {
             continue;
         }
-        let mut data = Vec::new();
+        if entry.size() > MAX_BINARY_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
+        let mut data = Vec::with_capacity(entry.size() as usize);
         entry
+            .take(MAX_BINARY_BYTES + 1)
             .read_to_end(&mut data)
             .map_err(|e| ExternalBinaryError::ExtractFailed(e.to_string()))?;
+        if data.len() as u64 > MAX_BINARY_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
         return write_executable_atomically(&data, cache_dir, wanted_file_name);
     }
 
@@ -234,6 +241,14 @@ pub fn extract_file_from_tar_gz(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_binary_names_that_escape_the_cache() {
+        for name in ["../outside", "/tmp/outside", "a\\\\b", ""] {
+            assert!(matches!(validate_binary_name(name), Err(ExternalBinaryError::InvalidBinaryName)));
+        }
+        assert!(validate_binary_name("tailscale").is_ok());
+    }
 
     // Vanliga enhetstester får inte bero på extern nätåtkomst eller en
     // tredje parts rate limits. Fixturen serveras därför från en lokal
