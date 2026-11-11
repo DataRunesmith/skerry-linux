@@ -26,7 +26,9 @@ fn normalize_path(path: &Path) -> io::Result<PathBuf> {
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() && !path.is_absolute() {
+                if matches!(normalized.components().next_back(), Some(Component::Normal(_))) {
+                    normalized.pop();
+                } else if !path.is_absolute() {
                     normalized.push("..");
                 }
             }
@@ -143,6 +145,26 @@ mod tests {
         let home = PathBuf::from("/home/alice/../alice");
         let resolved = resolve_from_home(Some(home), Path::new("hosts.json")).unwrap();
         assert_eq!(resolved, PathBuf::from("/home/alice/.skerry/hosts.json"));
+    }
+
+    #[test]
+    fn preserves_unresolved_parents_in_relative_paths() {
+        for (input, expected) in [
+            ("../..", "../.."),
+            ("../../foo", "../../foo"),
+            ("../foo/../../bar", "../../bar"),
+            ("foo/../../bar", "../bar"),
+            ("foo/../bar", "bar"),
+        ] {
+            assert_eq!(normalize_path(Path::new(input)).unwrap(), PathBuf::from(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn absolute_paths_cannot_traverse_above_root() {
+        for (input, expected) in [("/../..", "/"), ("/foo/../../../bar", "/bar")] {
+            assert_eq!(normalize_path(Path::new(input)).unwrap(), PathBuf::from(expected), "{input}");
+        }
     }
 
     #[test]
