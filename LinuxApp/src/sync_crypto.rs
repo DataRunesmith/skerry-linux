@@ -70,6 +70,9 @@ pub fn seal(
     passphrase: &str,
     iterations: u32,
 ) -> Result<Vec<u8>, SyncCryptoError> {
+    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+        return Err(SyncCryptoError::BadFormat);
+    }
     let salt: [u8; SALT_LEN] = random_bytes();
     let key = derive_key(passphrase, &salt, iterations);
 
