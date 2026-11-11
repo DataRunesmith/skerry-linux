@@ -64,7 +64,7 @@ const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 fn validate_binary_name(name: &str) -> Result<(), ExternalBinaryError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.as_bytes().contains(&0) {
         return Err(ExternalBinaryError::InvalidBinaryName);
     }
     Ok(())
@@ -110,12 +110,23 @@ pub async fn fetch(
     // cachat försök) — städa bort tyst, hämta rent på nytt nedan.
     let _ = std::fs::remove_file(&destination);
 
-    let response = client.get(url).send().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
+    let mut response = client.get(url).send().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
     let status = response.status();
     if !status.is_success() {
         return Err(ExternalBinaryError::DownloadFailed(format!("HTTP {status} för {url}")));
     }
-    let data = response.bytes().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
+    if response.content_length().is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64) {
+        return Err(ExternalBinaryError::DownloadTooLarge);
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await
+        .map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?
+    {
+        if data.len().saturating_add(chunk.len()) > MAX_DOWNLOAD_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
+        data.extend_from_slice(&chunk);
+    }
 
     let actual = sha256_hex(&data);
     if actual != expected {
@@ -136,19 +147,36 @@ fn write_executable_atomically(
     cache_dir: &std::path::Path,
     name: &str,
 ) -> Result<std::path::PathBuf, ExternalBinaryError> {
-    std::fs::create_dir_all(cache_dir).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
-    let destination = cache_dir.join(name);
-    let tmp = cache_dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, data).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&tmp).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perms).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    validate_binary_name(name)?;
+    if data.len() as u64 > MAX_BINARY_BYTES {
+        return Err(ExternalBinaryError::DownloadTooLarge);
     }
-    let _ = std::fs::remove_file(&destination);
-    std::fs::rename(&tmp, &destination).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    std::fs::create_dir_all(cache_dir).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    let metadata = std::fs::symlink_metadata(cache_dir)
+        .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ExternalBinaryError::CacheWriteFailed("cache path is not a real directory".into()));
+    }
+
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let destination = cache_dir.join(name);
+    let tmp = cache_dir.join(format!(".skerry-{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &destination)?;
+        std::fs::File::open(cache_dir)?.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ExternalBinaryError::CacheWriteFailed(error.to_string()));
+    }
     Ok(destination)
 }
 
