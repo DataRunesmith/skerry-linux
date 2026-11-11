@@ -64,7 +64,7 @@ const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 fn validate_binary_name(name: &str) -> Result<(), ExternalBinaryError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.contains('\\0') {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err(ExternalBinaryError::InvalidBinaryName);
     }
     Ok(())
