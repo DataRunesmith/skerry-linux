@@ -58,16 +58,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Set up stable Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable toolchain action, SHA pinned
         with:
           toolchain: stable
-      - name: Install cargo-audit
+      - name: Install cargo-audit before checking out untrusted source
         run: cargo install cargo-audit --version 0.23.0 --locked
-      - name: Audit locked dependencies
-        working-directory: LinuxApp
-        run: cargo audit --file Cargo.lock
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit locked dependencies outside the untrusted checkout
+        working-directory: ${{ runner.temp }}
+        run: cargo audit --file "$GITHUB_WORKSPACE/LinuxApp/Cargo.lock"
