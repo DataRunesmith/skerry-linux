@@ -103,9 +103,11 @@ pub fn validate_storage_path(path: &Path) -> io::Result<()> {
 /// Resolve a path below `~/.skerry` without creating anything.
 pub fn path(relative: impl AsRef<Path>) -> io::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(missing_home_error)?;
-    // Resolve the trusted home directory first. This accepts legitimate HOME
-    // values containing ".." and avoids treating a symlinked home alias as an
-    // untrusted storage-path component.
+    // Normalize before canonicalizing: the kernel otherwise requires every
+    // intermediate component to exist, even when a later ".." removes it.
+    let home = normalize_path(&home)?;
+    // Resolve the trusted home directory first, so a legitimate HOME value
+    // containing ".." is accepted without trusting symlinked storage paths.
     let home = std::fs::canonicalize(home)?;
     resolve_from_home(Some(home), relative.as_ref())
 }
