@@ -41,7 +41,7 @@ jobs:
         id: semgrep_scan
         env:
           SEMGREP_SEND_METRICS: "off"
-        run: semgrep scan --config p/default --sarif --output semgrep.sarif .
+        run: semgrep scan --strict --config p/default --sarif --output semgrep.sarif .
       - name: Validate Semgrep SARIF report
         if: ${{ !cancelled() && steps.semgrep_scan.outcome == 'success' }}
         shell: bash
