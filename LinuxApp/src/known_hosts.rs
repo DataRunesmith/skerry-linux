@@ -231,7 +231,7 @@ impl KnownHosts {
             }
         }
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let mut file = options.open(path)?;
