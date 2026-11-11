@@ -691,7 +691,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("skerry-symlink-read-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let outside = dir.join("outside.json");
-        std::fs::write(&outside, r#"{\"hosts\":[],\"snippets\":[],\"tombstones\":[]}"#).unwrap();
+        std::fs::write(&outside, r#"{"hosts":[],"snippets":[],"tombstones":[]}"#).unwrap();
         let link = dir.join("hosts.json");
         symlink(&outside, &link).unwrap();
 
