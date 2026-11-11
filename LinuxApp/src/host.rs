@@ -305,8 +305,6 @@ impl<'de> Deserialize<'de> for SyncState {
     }
 }
 
-/// Persistent host-databas, `~/.skerry/hosts.json`. Motsvarar `HostStore.swift`
-/// — samma fil kan läsas/skrivas av App/(iOS/macOS), Android och LinuxApp.
 /// Read the final path component without following a symbolic link.
 fn read_storage_file(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read as _;
@@ -323,6 +321,8 @@ fn read_storage_file(path: &std::path::Path) -> std::io::Result<String> {
     Ok(contents)
 }
 
+/// Persistent host-databas, `~/.skerry/hosts.json`. Motsvarar `HostStore.swift`
+/// — samma fil kan läsas/skrivas av App/(iOS/macOS), Android och LinuxApp.
 pub struct HostStore {
     path: std::path::PathBuf,
     state: SyncState,
