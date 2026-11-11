@@ -116,7 +116,7 @@ impl KnownHosts {
     fn load(path: Option<&Path>) -> std::io::Result<HashMap<String, String>> {
         let Some(path) = path else { return Ok(HashMap::new()) };
         use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut options = std::fs::OpenOptions::new();
         options.read(true).custom_flags(libc::O_NOFOLLOW);
         let file = match options.open(path) {
