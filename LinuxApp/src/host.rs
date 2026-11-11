@@ -307,6 +307,22 @@ impl<'de> Deserialize<'de> for SyncState {
 
 /// Persistent host-databas, `~/.skerry/hosts.json`. Motsvarar `HostStore.swift`
 /// — samma fil kan läsas/skrivas av App/(iOS/macOS), Android och LinuxApp.
+/// Read the final path component without following a symbolic link.
+fn read_storage_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
 pub struct HostStore {
     path: std::path::PathBuf,
     state: SyncState,
@@ -328,14 +344,8 @@ impl HostStore {
     /// `upsert`/`delete` skrev då permanent över en bara TRUNKERAD (inte
     /// tom) fil med ett tomt tillstånd, en tyst dataförlust utan varning.
     fn load(path: &std::path::Path) -> std::io::Result<SyncState> {
-        // Prevent path traversal attacks by rejecting paths containing '..'.
-        if path.components().any(|c| c == std::path::Component::ParentDir) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid input: {}", path.display()),
-            ));
-        }
-        let data = match std::fs::read_to_string(path) {
+        crate::storage_path::validate_storage_path(path)?;
+        let data = match read_storage_file(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncState::default()),
             Err(e) => return Err(e),
@@ -490,6 +500,7 @@ impl HostStore {
     }
 
     fn persist(&self) -> std::io::Result<()> {
+        crate::storage_path::validate_storage_path(&self.path)?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
@@ -498,6 +509,9 @@ impl HostStore {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
+        // Re-check after directory creation so an existing symlinked parent
+        // is rejected before the atomic write is attempted.
+        crate::storage_path::validate_storage_path(&self.path)?;
         let json = serde_json::to_string_pretty(&self.state)?;
         crate::fsutil::atomic_write(&self.path, json.as_bytes())
     }
@@ -657,6 +671,55 @@ mod tests {
             result.is_err(),
             "en HostAuth med flera case-nycklar ska avvisas, inte godtyckligt välja en"
         );
+    }
+
+    #[test]
+    fn host_store_rejects_parent_directory_components() {
+        let dir = std::env::temp_dir().join(format!("skerry-traversal-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("..").join("hosts.json");
+        let err = HostStore::open(path).err().expect("parent traversal must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_store_rejects_a_symlinked_file_on_read() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("skerry-symlink-read-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside.json");
+        std::fs::write(&outside, r#"{\"hosts\":[],\"snippets\":[],\"tombstones\":[]}"#).unwrap();
+        let link = dir.join("hosts.json");
+        symlink(&outside, &link).unwrap();
+
+        let err = HostStore::open(link).err().expect("symlinked file must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_store_rejects_a_symlinked_parent_on_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("skerry-symlink-write-{}", Uuid::new_v4()));
+        let parent = root.join("storage");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = parent.join("hosts.json");
+        let mut store = HostStore::open(path).unwrap();
+
+        std::fs::remove_dir(&parent).unwrap();
+        symlink(&outside, &parent).unwrap();
+        let host = Host::new("blocked".into(), "127.0.0.1".into(), "user".into());
+        let err = store.upsert(host).expect_err("write through symlink must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!outside.join("hosts.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
