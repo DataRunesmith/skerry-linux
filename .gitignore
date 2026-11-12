@@ -244,3 +244,6 @@ Thumbs.db
 .vscode/
 
 target/
+
+# Local Claude Code statusline script, kept outside the repository
+statusline.sh
