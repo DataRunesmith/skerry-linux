@@ -4,9 +4,9 @@
 
 <!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:57a9d2cb298ba40f0906a663b0d5920881000f91e25ec2b8065283ce14e88f66 -->
+<!-- coderabbit-ai-generated-section:v1:1f201c4d9e89bc05ec8158441941c4bd1c2bb2f0da61a4bebe5a331adba29457 -->
 
-Rust 1.92 or newer and the development packages for GTK 4.12 or newer, libadwaita 1.5 or newer, GtkSourceView 5 and VTE for GTK4. On Debian 13, install `libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev libvte-2.91-gtk4-dev`.
+Rust 1.92 or newer and the development packages for GTK 4.12 or newer, libadwaita 1.5 or newer, GtkSourceView 5 and VTE for GTK4. On Debian 13, install `build-essential libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev libvte-2.91-gtk4-dev`.
 
 <!-- /coderabbit-ai-generated:v1 -->
 
