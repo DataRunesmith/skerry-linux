@@ -46,8 +46,11 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         return Err(e);
     }
     std::fs::rename(&tmp_path, path)?;
-    // Persist the directory entry as well as the file contents.
-    std::fs::File::open(dir)?.sync_all()
+    // The file has replaced the target, so the write succeeded. Syncing the
+    // directory entry is best effort: reporting an error here would tell the
+    // caller the write failed when the new contents are already in place.
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    Ok(())
 }
 
 #[cfg(test)]

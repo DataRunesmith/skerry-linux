@@ -20,6 +20,8 @@ pub enum Verdict {
     StorageFailure,
 }
 
+const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
+
 pub struct KnownHosts {
     path: Option<PathBuf>,
     entries: Mutex<HashMap<String, String>>,
@@ -118,7 +120,9 @@ impl KnownHosts {
         use std::io::Read;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK: opening a FIFO without a writer must not hang; the
+        // regular-file check below then rejects it.
+        options.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = match options.open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
@@ -130,6 +134,9 @@ impl KnownHosts {
                 std::io::ErrorKind::InvalidData,
                 "known_hosts must be a regular file no larger than 4 MiB",
             ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         let mut text = String::new();
         file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
@@ -237,8 +244,22 @@ impl KnownHosts {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "known_hosts is not a regular file"));
         }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(format!("{id} {key_string}\\n").as_bytes())?;
-        file.sync_all()
+        let record = format!("{id} {key_string}\n");
+        let original_len = file.metadata()?.len();
+        // `load` rejects files above the limit, so never write past it.
+        if original_len.saturating_add(record.len() as u64) > MAX_KNOWN_HOSTS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts would exceed the 4 MiB limit",
+            ));
+        }
+        let written = file.write_all(record.as_bytes()).and_then(|_| file.sync_all());
+        if let Err(error) = written {
+            // Do not leave a partial record behind.
+            let _ = file.set_len(original_len);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -289,7 +310,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let outside = root.join("outside");
         let link = root.join("known_hosts");
-        std::fs::write(&outside, "srv:22 ssh-ed25519 AAAAattacker\\n").unwrap();
+        std::fs::write(&outside, "srv:22 ssh-ed25519 AAAAattacker\n").unwrap();
         symlink(&outside, &link).unwrap();
 
         assert!(KnownHosts::open(Some(link.clone())).is_err());
@@ -300,7 +321,7 @@ mod tests {
         assert_eq!(store.check("srv", 22, "ssh-ed25519 AAAAattacker"), Verdict::StorageFailure);
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
-            "srv:22 ssh-ed25519 AAAAattacker\\n"
+            "srv:22 ssh-ed25519 AAAAattacker\n"
         );
         std::fs::remove_dir_all(root).ok();
     }
