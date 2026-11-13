@@ -244,3 +244,7 @@ Thumbs.db
 .vscode/
 
 target/
+
+# Built documentation site
+site/
+.venv-docs/
