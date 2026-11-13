@@ -108,6 +108,7 @@ pub struct SshSession {
 pub(crate) enum ConnectError {
     Russh(russh::Error),
     HostKeyChanged(String),
+    KnownHostsStorage,
 }
 
 impl From<russh::Error> for ConnectError {
@@ -121,6 +122,7 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Russh(e) => write!(f, "{e}"),
             ConnectError::HostKeyChanged(msg) => write!(f, "{msg}"),
+            ConnectError::KnownHostsStorage => write!(f, "known_hosts kunde inte sparas säkert; SSH-anslutningen avvisades"),
         }
     }
 }
@@ -197,7 +199,13 @@ impl client::Handler for ClientHandler {
             server_public_key.algorithm().as_str(),
             server_public_key.public_key_base64()
         );
-        match self.known_hosts.check(&self.host, self.port, &key_string) {
+        // `check` may fsync the trust store; keep that off the async runtime.
+        let known_hosts = Arc::clone(&self.known_hosts);
+        let (host, port, key_to_check) = (self.host.clone(), self.port, key_string.clone());
+        let verdict = tokio::task::spawn_blocking(move || known_hosts.check(&host, port, &key_to_check))
+            .await
+            .map_err(|_| ConnectError::KnownHostsStorage)?;
+        match verdict {
             Verdict::Trusted | Verdict::Learned => Ok(true),
             Verdict::Changed(stored) => Err(ConnectError::HostKeyChanged(format!(
                 "VÄRDNYCKELN FÖR {}:{} HAR ÄNDRATS — möjlig man-i-mitten-attack eller en \
@@ -206,6 +214,7 @@ impl client::Handler for ClientHandler {
                  ~/.skerry/known_hosts manuellt.",
                 self.host, self.port
             ))),
+            Verdict::StorageFailure => Err(ConnectError::KnownHostsStorage),
         }
     }
 

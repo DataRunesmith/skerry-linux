@@ -16,7 +16,11 @@ pub enum Verdict {
     Learned,
     /// Skiljer sig från lagrad nyckel (potentiell MITM eller ombyggd server).
     Changed(String),
+    /// The trust store could not be read or durably updated.
+    StorageFailure,
 }
+
+const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
 
 pub struct KnownHosts {
     path: Option<PathBuf>,
@@ -113,11 +117,35 @@ impl KnownHosts {
     /// "går inte att tolka"). Värt att rapportera uppåt till Swift-sidan.
     fn load(path: Option<&Path>) -> std::io::Result<HashMap<String, String>> {
         let Some(path) = path else { return Ok(HashMap::new()) };
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = std::fs::OpenOptions::new();
+        // O_NONBLOCK: opening a FIFO without a writer must not hang; the
+        // regular-file check below then rejects it.
+        options.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = match options.open(path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(e),
         };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts must be a regular file no larger than 4 MiB",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut text = String::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+        if text.len() > 4 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts exceeded the 4 MiB read limit",
+            ));
+        }
         Ok(text
             .lines()
             .filter_map(|line| line.split_once(' '))
@@ -137,9 +165,13 @@ impl KnownHosts {
                 Verdict::Changed(stored.clone())
             }
         } else {
-            entries.insert(id.clone(), key_string.to_string());
-            self.append(&id, key_string);
-            Verdict::Learned
+            match self.append(&id, key_string) {
+                Ok(()) => {
+                    entries.insert(id, key_string.to_string());
+                    Verdict::Learned
+                }
+                Err(_) => Verdict::StorageFailure,
+            }
         }
     }
 
@@ -170,11 +202,17 @@ impl KnownHosts {
     /// nästa gång, alltså precis det MITM-skydd filen finns för.
     pub fn forget(&self, id: &str) -> std::io::Result<bool> {
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
-        if entries.remove(id).is_none() {
-            return Ok(false);
-        }
         let Some(path) = &self.path else {
-            return Ok(true);
+            return Ok(entries.remove(id).is_some());
+        };
+        let _lock = Self::lock_store(path)?;
+        // Re-read under the lock so records learned by other connections
+        // since this instance was opened are not dropped by the rewrite.
+        if let Ok(fresh) = Self::open(Some(path.clone())) {
+            *entries = fresh.entries.into_inner().expect("known_hosts-låset förgiftat");
+        }
+        let Some(removed) = entries.remove(id) else {
+            return Ok(false);
         };
 
         let mut lines: Vec<String> = entries
@@ -186,37 +224,75 @@ impl KnownHosts {
         if !text.is_empty() {
             text.push('\n');
         }
-        crate::fsutil::atomic_write(path, text.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(error) = crate::fsutil::atomic_write(path, text.as_bytes()) {
+            entries.insert(id.to_string(), removed);
+            return Err(error);
         }
         Ok(true)
     }
 
-    fn append(&self, id: &str, key_string: &str) {
-        let Some(path) = &self.path else { return };
+    /// Takes an exclusive advisory lock shared by every `KnownHosts`
+    /// instance (and process) using this path. Held for the whole
+    /// length-check/append/sync/rollback sequence so a rollback can never
+    /// truncate another connection's committed record.
+    fn lock_store(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(PathBuf::from(lock_name))?;
+        // SAFETY: the descriptor is valid for the lifetime of `lock`.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(lock)
+    }
+
+    fn append(&self, id: &str, key_string: &str) -> std::io::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
-        let existed = path.exists();
+        let _lock = Self::lock_store(path)?;
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(format!("{id} {key_string}\n").as_bytes());
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "known_hosts is not a regular file"));
         }
-        if !existed {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let record = format!("{id} {key_string}\n");
+        let original_len = file.metadata()?.len();
+        // `load` rejects files above the limit, so never write past it.
+        if original_len.saturating_add(record.len() as u64) > MAX_KNOWN_HOSTS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known_hosts would exceed the 4 MiB limit",
+            ));
         }
+        let written = file.write_all(record.as_bytes()).and_then(|_| file.sync_all());
+        if let Err(error) = written {
+            // Do not leave a partial record behind.
+            let _ = file.set_len(original_len);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -259,6 +335,29 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_trust_store_is_rejected_and_never_learns_a_key() {
+        use std::os::unix::fs::symlink;
+        let root = temp_path();
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.join("outside");
+        let link = root.join("known_hosts");
+        std::fs::write(&outside, "srv:22 ssh-ed25519 AAAAattacker\n").unwrap();
+        symlink(&outside, &link).unwrap();
+
+        assert!(KnownHosts::open(Some(link.clone())).is_err());
+        let store = KnownHosts {
+            path: Some(link),
+            entries: Mutex::new(HashMap::new()),
+        };
+        assert_eq!(store.check("srv", 22, "ssh-ed25519 AAAAattacker"), Verdict::StorageFailure);
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "srv:22 ssh-ed25519 AAAAattacker\n"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
     #[test]
     fn different_ports_are_independent_hosts() {
         let path = temp_path();

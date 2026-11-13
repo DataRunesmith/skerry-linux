@@ -36,6 +36,9 @@ pub enum ExternalBinaryError {
     /// namn som ändrats mellan versioner, inte ett nätverksproblem.
     EntryNotFound(String),
     ExtractFailed(String),
+    InvalidBinaryName,
+    InvalidChecksum,
+    DownloadTooLarge,
 }
 
 impl std::fmt::Display for ExternalBinaryError {
@@ -50,10 +53,22 @@ impl std::fmt::Display for ExternalBinaryError {
                 write!(f, "fel checksumma: förväntade {expected}, fick {actual}")
             }
             ExternalBinaryError::CacheWriteFailed(e) => write!(f, "kunde inte skriva till cachen: {e}"),
+            ExternalBinaryError::InvalidBinaryName => write!(f, "ogiltigt binärfilnamn"),
+            ExternalBinaryError::InvalidChecksum => write!(f, "ogiltigt SHA256-värde"),
+            ExternalBinaryError::DownloadTooLarge => write!(f, "nedladdningen överskred storleksgränsen"),
         }
     }
 }
 
+const MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn validate_binary_name(name: &str) -> Result<(), ExternalBinaryError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.as_bytes().contains(&0) {
+        return Err(ExternalBinaryError::InvalidBinaryName);
+    }
+    Ok(())
+}
 pub fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -74,32 +89,88 @@ pub async fn fetch(
     cache_dir: &std::path::Path,
     binary_name: &str,
 ) -> Result<std::path::PathBuf, ExternalBinaryError> {
-    let destination = cache_dir.join(binary_name);
-    let expected = expected_sha256.to_lowercase();
-
-    if let Ok(existing) = std::fs::read(&destination)
-        && sha256_hex(&existing) == expected
-    {
-        return Ok(destination);
+    validate_binary_name(binary_name)?;
+    let expected = expected_sha256.to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ExternalBinaryError::InvalidChecksum);
     }
-    // Finns men med fel checksumma (korrupt eller ett gammalt, felaktigt
-    // cachat försök) — städa bort tyst, hämta rent på nytt nedan.
-    let _ = std::fs::remove_file(&destination);
+    let destination = {
+        let cache_dir = cache_dir.to_path_buf();
+        let binary_name = binary_name.to_string();
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || check_cache(&cache_dir, &binary_name, &expected))
+            .await
+            .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))??
+    };
+    if let CacheState::Hit(path) = destination {
+        return Ok(path);
+    }
 
-    let response = client.get(url).send().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
+    let mut response = client.get(url).send().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
     let status = response.status();
     if !status.is_success() {
         return Err(ExternalBinaryError::DownloadFailed(format!("HTTP {status} för {url}")));
     }
-    let data = response.bytes().await.map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?;
+    if response.content_length().is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64) {
+        return Err(ExternalBinaryError::DownloadTooLarge);
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await
+        .map_err(|e| ExternalBinaryError::DownloadFailed(e.to_string()))?
+    {
+        if data.len().saturating_add(chunk.len()) > MAX_DOWNLOAD_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
+        data.extend_from_slice(&chunk);
+    }
 
     let actual = sha256_hex(&data);
     if actual != expected {
         return Err(ExternalBinaryError::ChecksumMismatch { expected, actual });
     }
 
-    write_executable_atomically(&data, cache_dir, binary_name)?;
-    Ok(destination)
+    let cache_dir = cache_dir.to_path_buf();
+    let binary_name = binary_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        write_executable_atomically(&data, &cache_dir, &binary_name, MAX_DOWNLOAD_BYTES as u64)
+    })
+    .await
+    .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?
+}
+
+enum CacheState {
+    Hit(std::path::PathBuf),
+    Miss,
+}
+
+/// Blocking: validates the cache directory, then returns a hit only for a
+/// regular file with the expected checksum. Anything else at the destination
+/// is removed so the caller can download afresh.
+fn check_cache(
+    cache_dir: &std::path::Path,
+    binary_name: &str,
+    expected: &str,
+) -> Result<CacheState, ExternalBinaryError> {
+    let fail = |e: std::io::Error| ExternalBinaryError::CacheWriteFailed(e.to_string());
+    std::fs::create_dir_all(cache_dir).map_err(fail)?;
+    let cache_metadata = std::fs::symlink_metadata(cache_dir).map_err(fail)?;
+    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+        return Err(ExternalBinaryError::CacheWriteFailed("cache path is not a real directory".into()));
+    }
+    let destination = cache_dir.join(binary_name);
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            std::fs::remove_file(&destination).map_err(fail)?;
+        } else if metadata.len() <= MAX_DOWNLOAD_BYTES as u64
+            && let Ok(existing) = std::fs::read(&destination)
+            && sha256_hex(&existing) == expected
+        {
+            return Ok(CacheState::Hit(destination));
+        }
+    }
+    // Wrong checksum (corrupt or stale): remove quietly and download again.
+    let _ = std::fs::remove_file(&destination);
+    Ok(CacheState::Miss)
 }
 
 /// Skriver `data` som en körbar fil på `cache_dir/name`.
@@ -111,20 +182,40 @@ fn write_executable_atomically(
     data: &[u8],
     cache_dir: &std::path::Path,
     name: &str,
+    max_bytes: u64,
 ) -> Result<std::path::PathBuf, ExternalBinaryError> {
-    std::fs::create_dir_all(cache_dir).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
-    let destination = cache_dir.join(name);
-    let tmp = cache_dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, data).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&tmp).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perms).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    validate_binary_name(name)?;
+    if data.len() as u64 > max_bytes {
+        return Err(ExternalBinaryError::DownloadTooLarge);
     }
-    let _ = std::fs::remove_file(&destination);
-    std::fs::rename(&tmp, &destination).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    std::fs::create_dir_all(cache_dir).map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    let metadata = std::fs::symlink_metadata(cache_dir)
+        .map_err(|e| ExternalBinaryError::CacheWriteFailed(e.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ExternalBinaryError::CacheWriteFailed("cache path is not a real directory".into()));
+    }
+
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let destination = cache_dir.join(name);
+    let tmp = cache_dir.join(format!(".skerry-{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&tmp)?;
+        file.write_all(data)?;
+        // Tools run by other users/groups of the machine need execute bits.
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &destination)?;
+        std::fs::File::open(cache_dir)?.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ExternalBinaryError::CacheWriteFailed(error.to_string()));
+    }
     Ok(destination)
 }
 
@@ -163,17 +254,32 @@ pub fn extract_file_from_tar_gz(
             .path()
             .map_err(|e| ExternalBinaryError::ExtractFailed(e.to_string()))?
             .into_owned();
+        if path.is_absolute()
+            || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(ExternalBinaryError::ExtractFailed(format!(
+                "arkivet innehåller en osäker sökväg: {}",
+                path.display()
+            )));
+        }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name != wanted_file_name {
+        if name != wanted_file_name || !entry.header().entry_type().is_file() {
             continue;
         }
-        let mut data = Vec::new();
+        if entry.size() > MAX_BINARY_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
+        let mut data = Vec::with_capacity(entry.size() as usize);
         entry
+            .take(MAX_BINARY_BYTES + 1)
             .read_to_end(&mut data)
             .map_err(|e| ExternalBinaryError::ExtractFailed(e.to_string()))?;
-        return write_executable_atomically(&data, cache_dir, wanted_file_name);
+        if data.len() as u64 > MAX_BINARY_BYTES {
+            return Err(ExternalBinaryError::DownloadTooLarge);
+        }
+        return write_executable_atomically(&data, cache_dir, wanted_file_name, MAX_BINARY_BYTES);
     }
 
     Err(ExternalBinaryError::EntryNotFound(wanted_file_name.to_string()))
@@ -182,6 +288,14 @@ pub fn extract_file_from_tar_gz(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_binary_names_that_escape_the_cache() {
+        for name in ["../outside", "/tmp/outside", "a\\\\b", ""] {
+            assert!(matches!(validate_binary_name(name), Err(ExternalBinaryError::InvalidBinaryName)));
+        }
+        assert!(validate_binary_name("tailscale").is_ok());
+    }
 
     // Vanliga enhetstester får inte bero på extern nätåtkomst eller en
     // tredje parts rate limits. Fixturen serveras därför från en lokal
@@ -391,13 +505,12 @@ mod tests {
             "mapp/../../skerry-skulle-inte-skrivas",
         ] {
             let archive = tar_gz_with_raw_path(evil, b"OND");
-            let path = extract_file_from_tar_gz(&archive, "skerry-skulle-inte-skrivas", &dir)
-                .unwrap_or_else(|e| panic!("uppackning av {evil:?} gav {e}"));
-            assert_eq!(
-                path,
-                dir.join("skerry-skulle-inte-skrivas"),
-                "filen ska hamna i cachen, inte där arkivet pekade ({evil})"
+            let result = extract_file_from_tar_gz(&archive, "skerry-skulle-inte-skrivas", &dir);
+            assert!(
+                matches!(result, Err(ExternalBinaryError::ExtractFailed(_))),
+                "osäker sökväg {evil:?} ska avvisas, fick {result:?}"
             );
+            assert!(!dir.join("skerry-skulle-inte-skrivas").exists(), "inget ska skrivas i cachen via {evil}");
             assert!(!outside.exists(), "arkivet skrev utanför cachen via {evil}");
         }
         std::fs::remove_dir_all(&dir).ok();

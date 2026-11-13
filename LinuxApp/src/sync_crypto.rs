@@ -24,6 +24,7 @@ pub const DEFAULT_ITERATIONS: u32 = 210_000;
 /// billigt), `MAX` mot den dyra varianten.
 const MIN_ITERATIONS: u32 = 1_000;
 const MAX_ITERATIONS: u32 = 10_000_000;
+const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8] = b"BSYNC1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -70,6 +71,9 @@ pub fn seal(
     passphrase: &str,
     iterations: u32,
 ) -> Result<Vec<u8>, SyncCryptoError> {
+    if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+        return Err(SyncCryptoError::BadFormat);
+    }
     let salt: [u8; SALT_LEN] = random_bytes();
     let key = derive_key(passphrase, &salt, iterations);
 
@@ -77,6 +81,10 @@ pub fn seal(
     let nonce = Nonce::try_from(nonce_bytes.as_slice()).expect("12 bytes");
 
     let plaintext = serde_json::to_vec(state).map_err(|_| SyncCryptoError::BadFormat)?;
+    let max_plaintext = MAX_ENVELOPE_BYTES - MAGIC.len() - 4 - SALT_LEN - NONCE_LEN - 16;
+    if plaintext.len() > max_plaintext {
+        return Err(SyncCryptoError::BadFormat);
+    }
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| SyncCryptoError::BadFormat)?;
     let ciphertext_and_tag = cipher
         .encrypt(&nonce, plaintext.as_ref())
@@ -94,7 +102,7 @@ pub fn seal(
 
 pub fn open(data: &[u8], passphrase: &str) -> Result<SyncState, SyncCryptoError> {
     let header_len = MAGIC.len() + 4 + SALT_LEN + NONCE_LEN;
-    if data.len() <= header_len || &data[..MAGIC.len()] != MAGIC {
+    if data.len() > MAX_ENVELOPE_BYTES || data.len() <= header_len || &data[..MAGIC.len()] != MAGIC {
         return Err(SyncCryptoError::BadFormat);
     }
     let iterations = u32::from_be_bytes(data[MAGIC.len()..MAGIC.len() + 4].try_into().unwrap());
@@ -233,6 +241,18 @@ mod tests {
             &first[nonce_offset..nonce_offset + NONCE_LEN],
             &second[nonce_offset..nonce_offset + NONCE_LEN],
             "varje kuvert måste ha en ny nonce"
+        );
+    }
+
+    #[test]
+    fn seal_rejects_out_of_range_iteration_counts() {
+        assert_eq!(
+            seal(&SyncState::default(), "pw", MIN_ITERATIONS - 1).unwrap_err(),
+            SyncCryptoError::BadFormat
+        );
+        assert_eq!(
+            seal(&SyncState::default(), "pw", MAX_ITERATIONS + 1).unwrap_err(),
+            SyncCryptoError::BadFormat
         );
     }
 

@@ -1,0 +1,143 @@
+name: Security scanning
+
+on:
+  push:
+    branches: [main, 'security/**']
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Remove stale Semgrep report
+        run: rm -f semgrep.sarif
+      - name: Run Semgrep
+        id: semgrep_scan
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: docker run --rm --volume "$GITHUB_WORKSPACE:/src" --workdir /src --user "$(id -u):$(id -g)" --env HOME=/tmp --env SEMGREP_SEND_METRICS=off semgrep/semgrep@sha256:31e9989dbc5e2019ea2f793196480e0b2e43f881984f324d2452254a167684e8 semgrep scan --strict --config p/default --sarif --output semgrep.sarif .
+      - name: Validate Semgrep SARIF report
+        if: ${{ !cancelled() && steps.semgrep_scan.outcome == 'success' }}
+        shell: bash
+        run: test -s semgrep.sarif
+      - name: Preserve Semgrep SARIF
+        id: semgrep_artifact
+        if: ${{ !cancelled() && steps.semgrep_scan.outcome == 'success' && hashFiles('semgrep.sarif') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+          if-no-files-found: error
+          retention-days: 1
+      - name: Summarize semgrep findings when SARIF upload is unavailable
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' && (steps.semgrep_scan.outcome == 'failure' || steps.semgrep_artifact.outcome == 'failure' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true)) }}
+        env:
+          SARIF_FILE: semgrep.sarif
+        run: |
+          jq -r '
+            [.runs[].results[]?] |
+            if length == 0 then "No findings reported."
+            else .[] |
+              (if any(.suppressions[]?; .kind == "inSource") then "Suppressed" else "Finding" end) as $kind |
+              ([.locations[]?.physicalLocation? | select(.artifactLocation.uri != null) | "\(.artifactLocation.uri):\(.region.startLine // 1)"] | join(", ") | @json) as $where |
+              "\($kind): \(.ruleId // "unknown") at \($where)"
+            end
+          ' "$SARIF_FILE"
+  cargo-audit:
+    name: Rust dependency audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable toolchain action, SHA pinned
+        with:
+          toolchain: stable
+      - name: Install cargo-audit before checking out untrusted source
+        run: cargo install cargo-audit --version 0.23.0 --locked
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit locked dependencies outside the untrusted checkout
+        working-directory: ${{ runner.temp }}
+        run: cargo audit --file "$GITHUB_WORKSPACE/LinuxApp/Cargo.lock"
+  publish-sarif:
+    name: Publish SARIF results
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) }}
+    needs: [semgrep]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out scanned revision for SARIF fingerprints
+        id: checkout_source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download scanner reports
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: sarif-*
+          path: ${{ runner.temp }}/sarif-artifacts
+          merge-multiple: true
+      - name: Validate expected SARIF artifacts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ needs.semgrep.result }}" = "success" ]; then test -s "$RUNNER_TEMP/sarif-artifacts/semgrep.sarif"; fi
+      - name: Upload Semgrep results
+        id: upload_semgrep
+        if: ${{ !cancelled() && steps.checkout_source.outcome == 'success' && needs.semgrep.result == 'success' }}
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif-artifacts/semgrep.sarif
+          checkout_path: ${{ github.workspace }}
+          category: semgrep
+      - name: Summarize Semgrep findings if SARIF publication fails
+        if: ${{ !cancelled() && (steps.upload_semgrep.outcome == 'failure' || steps.checkout_source.outcome == 'failure') }}
+        env:
+          SARIF_FILE: ${{ runner.temp }}/sarif-artifacts/semgrep.sarif
+        run: |
+          if [ -s "$SARIF_FILE" ]; then
+            jq -r '
+              [.runs[].results[]?] |
+              if length == 0 then "No findings reported."
+              else .[] |
+                (if any(.suppressions[]?; .kind == "inSource") then "Suppressed" else "Finding" end) as $kind |
+                ([.locations[]?.physicalLocation? | select(.artifactLocation.uri != null) | "\(.artifactLocation.uri):\(.region.startLine // 1)"] | join(", ") | @json) as $where |
+                "\($kind): \(.ruleId // "unknown") at \($where)"
+              end
+            ' "$SARIF_FILE"
+          else
+            echo "Semgrep SARIF artifact is unavailable."
+          fi

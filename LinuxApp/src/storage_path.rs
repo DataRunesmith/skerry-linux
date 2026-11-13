@@ -18,7 +18,52 @@ fn missing_home_error() -> io::Error {
 
 fn resolve_from_home(home: Option<PathBuf>, relative: &Path) -> io::Result<PathBuf> {
     let home = home.ok_or_else(missing_home_error)?;
-    Ok(home.join(SKERRY_DIR).join(relative))
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lagringssökvägen måste vara relativ och får inte innehålla '..'",
+        ));
+    }
+    let root = home.join(SKERRY_DIR);
+    let components: Vec<_> = relative.components().collect();
+    let mut candidate = root.clone();
+    let mut path_components = vec![root.clone()];
+    for component in &components {
+        if let std::path::Component::Normal(part) = component {
+            candidate.push(part);
+            path_components.push(candidate.clone());
+        }
+    }
+    for (index, candidate) in path_components.iter().enumerate() {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lagringskataloger får inte vara symboliska länkar",
+                ));
+            }
+            Ok(metadata) if index + 1 < path_components.len() && !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "en överordnad lagringskomponent är inte en katalog",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root.join(relative))
 }
 
 /// Resolve a path below `~/.skerry` without creating anything.
@@ -43,6 +88,19 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("hemkatalog"));
         assert!(err.to_string().contains("~/.skerry"));
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_directory_paths() {
+        let home = PathBuf::from("/home/example");
+        assert_eq!(
+            resolve_from_home(Some(home.clone()), Path::new("../outside")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            resolve_from_home(Some(home), Path::new("/etc/passwd")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
