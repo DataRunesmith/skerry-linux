@@ -305,22 +305,6 @@ impl<'de> Deserialize<'de> for SyncState {
     }
 }
 
-/// Read the final path component without following a symbolic link.
-fn read_storage_file(path: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    Ok(contents)
-}
-
 /// Persistent host-databas, `~/.skerry/hosts.json`. Motsvarar `HostStore.swift`
 /// — samma fil kan läsas/skrivas av App/(iOS/macOS), Android och LinuxApp.
 pub struct HostStore {
@@ -344,8 +328,7 @@ impl HostStore {
     /// `upsert`/`delete` skrev då permanent över en bara TRUNKERAD (inte
     /// tom) fil med ett tomt tillstånd, en tyst dataförlust utan varning.
     fn load(path: &std::path::Path) -> std::io::Result<SyncState> {
-        crate::storage_path::validate_storage_path(path)?;
-        let data = match read_storage_file(path) {
+        let data = match crate::storage_path::read_file(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncState::default()),
             Err(e) => return Err(e),
@@ -378,19 +361,21 @@ impl HostStore {
 
     pub fn upsert(&mut self, mut host: Host) -> std::io::Result<()> {
         host.modified_at = ReferenceDate::now();
-        self.state.tombstones.remove(&host.id);
-        if let Some(existing) = self.state.hosts.iter_mut().find(|h| h.id == host.id) {
-            *existing = host;
-        } else {
-            self.state.hosts.push(host);
-        }
-        self.persist()
+        self.mutate_and_persist(|state| {
+            state.tombstones.remove(&host.id);
+            if let Some(existing) = state.hosts.iter_mut().find(|h| h.id == host.id) {
+                *existing = host;
+            } else {
+                state.hosts.push(host);
+            }
+        })
     }
 
     pub fn delete(&mut self, id: Uuid) -> std::io::Result<()> {
-        self.state.hosts.retain(|h| h.id != id);
-        self.state.tombstones.insert(id, ReferenceDate::now());
-        self.persist()
+        self.mutate_and_persist(|state| {
+            state.hosts.retain(|h| h.id != id);
+            state.tombstones.insert(id, ReferenceDate::now());
+        })
     }
 
     /// Importerar värdar ur en `~/.ssh/config`-text — motsvarar
@@ -480,40 +465,42 @@ impl HostStore {
     ) -> std::io::Result<()> {
         let remote = provider.pull()?.unwrap_or_default();
         let local = SyncState {
-            hosts: std::mem::take(&mut self.state.hosts),
+            hosts: self.state.hosts.clone(),
             snippets: snippets.all().into_iter().cloned().collect(),
-            tombstones: std::mem::take(&mut self.state.tombstones),
+            tombstones: self.state.tombstones.clone(),
         };
         let merged = crate::sync::merge(local, remote);
 
         provider.push(&merged)?;
         snippets.replace_all(merged.snippets.clone())?;
-        self.state = SyncState { snippets: Vec::new(), ..merged };
-        self.persist()
+        let previous = std::mem::replace(
+            &mut self.state,
+            SyncState { snippets: Vec::new(), ..merged },
+        );
+        self.persist().inspect_err(|_| self.state = previous)
     }
 
     /// Skriver en gravsten utan att röra värdlistan — för poster som lever i
     /// en annan databas men delar sync-tillstånd (se `SnippetStore`).
     pub fn record_tombstone(&mut self, id: Uuid) -> std::io::Result<()> {
-        self.state.tombstones.insert(id, ReferenceDate::now());
-        self.persist()
+        self.mutate_and_persist(|state| {
+            state.tombstones.insert(id, ReferenceDate::now());
+        })
     }
 
     fn persist(&self) -> std::io::Result<()> {
-        crate::storage_path::validate_storage_path(&self.path)?;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
         let json = serde_json::to_string_pretty(&self.state)?;
-        // Re-check immediately before writing so a replaced parent directory
-        // is rejected before the atomic write is attempted.
-        crate::storage_path::validate_storage_path(&self.path)?;
-        crate::fsutil::atomic_write(&self.path, json.as_bytes())
+        // Validation, directory creation and the write all happen relative to
+        // directory handles, so a swapped parent cannot redirect them.
+        crate::storage_path::write_file_atomic(&self.path, json.as_bytes())
+    }
+
+    /// Applies `mutate` and persists; on failure the in-memory state is
+    /// restored so a rejected write is not committed by a later one.
+    fn mutate_and_persist(&mut self, mutate: impl FnOnce(&mut SyncState)) -> std::io::Result<()> {
+        let backup = self.state.clone();
+        mutate(&mut self.state);
+        self.persist().inspect_err(|_| self.state = backup)
     }
 
     /// Löser upp `host.jump_host_id` mot en riktig `Host` i den här
@@ -675,7 +662,7 @@ mod tests {
 
     #[test]
     fn host_store_rejects_parent_directory_components() {
-        let dir = std::env::temp_dir().join(format!("skerry-traversal-test-{}", Uuid::new_v4()));
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("skerry-traversal-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("..").join("hosts.json");
         let err = HostStore::open(path).err().expect("parent traversal must be rejected");
@@ -688,7 +675,7 @@ mod tests {
     fn host_store_rejects_a_symlinked_file_on_read() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!("skerry-symlink-read-{}", Uuid::new_v4()));
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("skerry-symlink-read-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let outside = dir.join("outside.json");
         std::fs::write(&outside, r#"{"hosts":[],"snippets":[],"tombstones":[]}"#).unwrap();
@@ -705,7 +692,7 @@ mod tests {
     fn host_store_rejects_a_symlinked_parent_on_write() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("skerry-symlink-write-{}", Uuid::new_v4()));
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("skerry-symlink-write-{}", Uuid::new_v4()));
         let parent = root.join("storage");
         let outside = root.join("outside");
         std::fs::create_dir_all(&parent).unwrap();
