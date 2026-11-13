@@ -22,7 +22,7 @@ cargo test --locked
 
 <!-- coderabbit-ai-generated-section:v1:0b1591fa903410c4eaad8954101cc7e3592fe4a829e07368d66d1202c1f33e09 -->
 
-Some tests are marked `#[ignore]` because they need a running `sshd`, a public key listed in `~/.ssh/authorized_keys` with `SKERRY_TEST_SSH_KEY` pointing to its corresponding private key, an SSH agent, Docker or internet access. `docker_list_command_parses_real_dockerd_output` requires at least one container (running or stopped), and `forwarded_agent_is_reachable_from_the_remote_side` requires an identity loaded in the SSH agent. Run them with `cargo test -- --ignored`.
+Some tests are marked `#[ignore]` because they need a running `sshd`, a public key listed in `~/.ssh/authorized_keys` with `SKERRY_TEST_SSH_KEY` pointing to its corresponding private key, an SSH agent, Docker, `python3` or internet access. `docker_list_command_parses_real_dockerd_output` requires at least one container (running or stopped), and `forwarded_agent_is_reachable_from_the_remote_side` requires an identity loaded in the SSH agent. Run them with `cargo test -- --ignored`.
 
 <!-- /coderabbit-ai-generated:v1 -->
 
