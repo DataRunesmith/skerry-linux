@@ -136,8 +136,18 @@ impl SnippetStore {
         id: Uuid,
         state: &mut crate::host::HostStore,
     ) -> std::io::Result<()> {
+        let removed = self.snippets.iter().find(|s| s.id == id).cloned();
         self.delete(id)?;
-        state.record_tombstone(id)
+        if let Err(error) = state.record_tombstone(id) {
+            // Without a durable tombstone a later sync would resurrect the
+            // snippet, so put it back and report the failure.
+            if let Some(snippet) = removed {
+                self.snippets.push(snippet);
+                let _ = self.persist();
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Ersätter hela innehållet — används av synken när det sammanslagna
