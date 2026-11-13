@@ -202,11 +202,17 @@ impl KnownHosts {
     /// nästa gång, alltså precis det MITM-skydd filen finns för.
     pub fn forget(&self, id: &str) -> std::io::Result<bool> {
         let mut entries = self.entries.lock().expect("known_hosts-låset förgiftat");
+        let Some(path) = &self.path else {
+            return Ok(entries.remove(id).is_some());
+        };
+        let _lock = Self::lock_store(path)?;
+        // Re-read under the lock so records learned by other connections
+        // since this instance was opened are not dropped by the rewrite.
+        if let Ok(fresh) = Self::open(Some(path.clone())) {
+            *entries = fresh.entries.into_inner().expect("known_hosts-låset förgiftat");
+        }
         let Some(removed) = entries.remove(id) else {
             return Ok(false);
-        };
-        let Some(path) = &self.path else {
-            return Ok(true);
         };
 
         let mut lines: Vec<String> = entries
@@ -225,6 +231,32 @@ impl KnownHosts {
         Ok(true)
     }
 
+    /// Takes an exclusive advisory lock shared by every `KnownHosts`
+    /// instance (and process) using this path. Held for the whole
+    /// length-check/append/sync/rollback sequence so a rollback can never
+    /// truncate another connection's committed record.
+    fn lock_store(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(PathBuf::from(lock_name))?;
+        // SAFETY: the descriptor is valid for the lifetime of `lock`.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(lock)
+    }
+
     fn append(&self, id: &str, key_string: &str) -> std::io::Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
         if let Some(dir) = path.parent() {
@@ -235,6 +267,7 @@ impl KnownHosts {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
         }
+        let _lock = Self::lock_store(path)?;
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut options = std::fs::OpenOptions::new();
